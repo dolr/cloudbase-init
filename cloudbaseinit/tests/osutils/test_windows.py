@@ -18,6 +18,8 @@ import functools
 import importlib
 import os
 
+import netaddr
+
 try:
     import unittest.mock as mock
 except ImportError:
@@ -61,6 +63,7 @@ class TestWindowsUtils(testutils.CloudbaseInitTestBase):
         self._win32service_mock = mock.MagicMock()
         self._winerror_mock = mock.MagicMock()
         self._winerror_mock.ERROR_SERVICE_DOES_NOT_EXIST = 0x424
+        self._mi_mock = mock.MagicMock()
         self._wmi_mock = mock.MagicMock()
         self._wmi_mock.x_wmi = WMIError
         self._moves_mock = mock.MagicMock()
@@ -81,6 +84,7 @@ class TestWindowsUtils(testutils.CloudbaseInitTestBase):
              'win32netcon': self._win32netcon_mock,
              'win32service': self._win32service_mock,
              'winerror': self._winerror_mock,
+             'mi': self._mi_mock,
              'wmi': self._wmi_mock,
              'six.moves': self._moves_mock,
              'six.moves.xmlrpc_client': self._xmlrpc_client_mock,
@@ -576,8 +580,9 @@ class TestWindowsUtils(testutils.CloudbaseInitTestBase):
 
         response = self._winutils.get_network_adapters()
         conn.return_value.query.assert_called_with(wql)
-        self.assertEqual([(mock_response.Name, mock_response.MACAddress)],
-                         response)
+        self.assertEqual(
+            [(mock_response.NetConnectionID, mock_response.MACAddress)],
+            response)
 
     def test_get_network_adapters(self):
         self._test_get_network_adapters(False)
@@ -585,18 +590,117 @@ class TestWindowsUtils(testutils.CloudbaseInitTestBase):
     def test_get_network_adapters_xp_2003(self):
         self._test_get_network_adapters(True)
 
-    def _test_set_static_network_config(self, adapter=True, static_val=(0,),
-                                        gateway_val=(0,), dns_val=(0,)):
-        conn = self._wmi_mock.WMI
-        mac_address = '54:EE:75:19:F4:61'
+    @mock.patch('cloudbaseinit.osutils.windows.WindowsUtils'
+                '._get_network_adapter')
+    def _test_enable_network_adapter(self, mock_get_network_adapter, enabled):
+        self._winutils.enable_network_adapter(
+            mock.sentinel.adapter_name, enabled)
+
+        mock_get_network_adapter.assert_called_once_with(
+            mock.sentinel.adapter_name)
+
+        adapter = mock_get_network_adapter.return_value
+        if enabled:
+            adapter.Enable.assert_called_once_with()
+        else:
+            adapter.Disable.assert_called_once_with()
+
+    def test_enable_network_adapter(self):
+        self._test_enable_network_adapter(enabled=True)
+
+    def test_disable_network_adapter(self):
+        self._test_enable_network_adapter(enabled=False)
+
+    @mock.patch('cloudbaseinit.osutils.windows.WindowsUtils'
+                '.check_os_version')
+    def _test_set_static_network_config(self, mock_check_os_version,
+                                        adapter=True, static_val=(0,),
+                                        gateway_val=(0,), dns_val=(0,),
+                                        legacy=False, ipv6=False):
+        mock_check_os_version.return_value = not legacy
+        if legacy:
+            self._test_set_static_network_config_legacy(
+                adapter, static_val, gateway_val, dns_val)
+        else:
+            self._test_set_static_network_config_new(ipv6=ipv6)
+
+    @mock.patch('cloudbaseinit.osutils.windows.WindowsUtils'
+                '._fix_network_adapter_dhcp')
+    def _test_set_static_network_config_new(self,
+                                            mock_fix_network_adapter_dhcp,
+                                            ipv6):
+        conn = self._wmi_mock.WMI.return_value
+        if ipv6:
+            mock.sentinel.address = "2001:db8::3"
+            mock.sentinel.prefix_len_or_netmask = 64
+        else:
+            mock.sentinel.address = "10.10.10.10"
+            mock.sentinel.prefix_len_or_netmask = "255.255.255.0"
+
+        adapter = mock.Mock()
+        adapter.GUID = mock.sentinel.adapter_guid
+        conn.Win32_NetworkAdapter.return_value = [adapter]
+
+        if netaddr.valid_ipv6(mock.sentinel.address):
+            family = self.windows_utils.AF_INET6
+        else:
+            family = self.windows_utils.AF_INET
+
+        existing_adapter = mock.Mock()
+        existing_adapter.IPAddress = mock.sentinel.address
+        conn.MSFT_NetIPAddress.return_value = [existing_adapter]
+
+        existing_route = mock.Mock()
+        existing_route.DestinationPrefix = "0.0.0.0"
+        conn.MSFT_NetRoute.return_value = [existing_route]
+
+        dns_client = mock.Mock()
+        conn.MSFT_DnsClientServerAddress.return_value = [dns_client]
+
+        self._winutils.set_static_network_config(
+            mock.sentinel.nick_name, mock.sentinel.address,
+            mock.sentinel.prefix_len_or_netmask, mock.sentinel.gateway,
+            [mock.sentinel.dns])
+
+        mock_fix_network_adapter_dhcp.assert_called_once_with(
+            mock.sentinel.nick_name, False, family)
+
+        conn.MSFT_NetIPAddress.assert_called_once_with(
+            AddressFamily=family, InterfaceAlias=mock.sentinel.nick_name)
+        existing_adapter.Delete_.assert_called_once_with()
+
+        conn.MSFT_NetRoute.assert_called_once_with(
+            AddressFamily=family, InterfaceAlias=mock.sentinel.nick_name)
+        existing_route.Delete_.assert_called_once_with()
+
+        ip_network = netaddr.IPNetwork(
+            u"%s/%s" % (
+                mock.sentinel.address, mock.sentinel.prefix_len_or_netmask))
+        prefix_len = ip_network.prefixlen
+
+        conn.MSFT_NetIPAddress.create.assert_called_once_with(
+            AddressFamily=family, InterfaceAlias=mock.sentinel.nick_name,
+            IPAddress=mock.sentinel.address, PrefixLength=prefix_len,
+            DefaultGateway=mock.sentinel.gateway)
+
+        custom_options = [{
+            u'name': u'ServerAddresses',
+            u'value_type': self._mi_mock.MI_ARRAY | self._mi_mock.MI_STRING,
+            u'value': [mock.sentinel.dns]
+        }]
+        operation_options = {u'custom_options': custom_options}
+        dns_client.put.assert_called_once_with(
+            operation_options=operation_options)
+
+    def _test_set_static_network_config_legacy(self, adapter, static_val,
+                                               gateway_val, dns_val):
+        conn = self._wmi_mock.WMI.return_value
+        nic_name = 'fake NIC'
         address = '10.10.10.10'
-        broadcast = '0.0.0.0'
         dns_list = ['8.8.8.8']
         set_static_call = functools.partial(
             self._winutils.set_static_network_config,
-            mac_address, address, self._NETMASK,
-            broadcast, self._GATEWAY, dns_list
-        )
+            nic_name, address, self._NETMASK, self._GATEWAY, dns_list)
 
         if adapter:
             adapter = mock.MagicMock()
@@ -614,8 +718,8 @@ class TestWindowsUtils(testutils.CloudbaseInitTestBase):
             if ret_val in (0, 1):
                 expected_log.append(msg)
 
-        conn.return_value.query.return_value = adapter
-        adapter_config = adapter[0].associators.return_value[0]
+        conn.Win32_NetworkAdapter.return_value = [adapter]
+        adapter_config = adapter.associators.return_value[0]
         adapter_config.EnableStatic.return_value = static_val
         adapter_config.SetGateways.return_value = gateway_val
         adapter_config.SetDNSServerSearchOrder.return_value = dns_val
@@ -633,10 +737,9 @@ class TestWindowsUtils(testutils.CloudbaseInitTestBase):
                 self.assertFalse(response)
             self.assertEqual(expected_log, self.snatcher.output)
 
-            select = ("SELECT * FROM Win32_NetworkAdapter WHERE "
-                      "MACAddress = '{}'".format(mac_address))
-            conn.return_value.query.assert_called_once_with(select)
-            adapter[0].associators.assert_called_with(
+            conn.Win32_NetworkAdapter.assert_called_once_with(
+                NetConnectionID=nic_name)
+            adapter.associators.assert_called_with(
                 wmi_result_class='Win32_NetworkAdapterConfiguration')
             adapter_config.EnableStatic.assert_called_with(
                 [address], [self._NETMASK])
@@ -645,123 +748,76 @@ class TestWindowsUtils(testutils.CloudbaseInitTestBase):
             adapter_config.SetDNSServerSearchOrder.assert_called_with(
                 dns_list)
 
-    @mock.patch('cloudbaseinit.osutils.windows.WindowsUtils'
-                '.check_os_version')
-    @mock.patch("cloudbaseinit.utils.windows.network"
-                ".get_adapter_addresses")
-    def _test_set_static_network_config_v6(self, mock_get_adapter_addresses,
-                                           mock_check_os_version,
-                                           v6adapters=True, v6error=False):
-        friendly_name = "Ethernet0"
-        interface_index = "4"
-        mac_address = '54:EE:75:19:F4:61'
-        address6 = "2001:db8::3"
-        netmask6 = "64"
-        gateway6 = "2001:db8::1"
-
-        conn = self._wmi_mock.WMI
-        netip = conn.return_value.query.return_value[0]
-        if v6error:
-            netip.Create.side_effect = WMIError
-        adapter_addresses = []
-        if v6adapters:
-            adapter_addresses = [
-                {
-                    "mac_address": mac_address,
-                    "friendly_name": friendly_name,
-                    "interface_index": interface_index
-                }
-            ]
-        mock_get_adapter_addresses.return_value = adapter_addresses
-        mock_check_os_version.return_value = True
-
-        set_static_call = functools.partial(
-            self._winutils.set_static_network_config_v6,
-            mac_address, address6, netmask6, gateway6)
-        expected_log = []
-        if not mock_check_os_version.return_value:
-            expected_log.append("Setting IPv6 info not available "
-                                "on this system")
-
-        if not v6adapters or v6error:
-            self.assertRaises(
-                exception.CloudbaseInitException,
-                set_static_call)
-        else:
-            expected_log.append("Setting IPv6 info for %s" % friendly_name)
-            with self.snatcher:
-                set_static_call()
-            mock_get_adapter_addresses.assert_called_once_with()
-            select = ("SELECT * FROM MSFT_NetIPAddress "
-                      "WHERE InterfaceAlias = '{}'".format(friendly_name))
-            conn.return_value.query.assert_called_once_with(select)
-            params = {
-                "InterfaceIndex": interface_index,
-                "InterfaceAlias": friendly_name,
-                "IPAddress": address6,
-                "AddressFamily": self.windows_utils.AF_INET6,
-                "PrefixLength": netmask6,
-                # Manual set type.
-                "Type": self.windows_utils.UNICAST,
-                "PrefixOrigin": self.windows_utils.MANUAL,
-                "SuffixOrigin": self.windows_utils.MANUAL,
-                "AddressState": self.windows_utils.PREFERRED_ADDR,
-                # No expiry.
-                "ValidLifetime": None,
-                "PreferredLifetime": None,
-                "SkipAsSource": False,
-                "DefaultGateway": gateway6,
-                "PolicyStore": None,
-                "PassThru": False,
-            }
-            netip.Create.assert_called_once_with(**params)
-            self.assertEqual(expected_log, self.snatcher.output)
-
-    def test_set_static_network_config(self):
+    def test_set_static_network_config_legacy(self):
         ret_val1 = (1,)
         ret_val2 = (1,)
         ret_val3 = (0,)
         self._test_set_static_network_config(static_val=ret_val1,
                                              gateway_val=ret_val2,
-                                             dns_val=ret_val3)
+                                             dns_val=ret_val3,
+                                             legacy=True)
 
-    def test_set_static_network_config_query_fail(self):
-        self._test_set_static_network_config(adapter=False)
+    def test_set_static_network_config_legacy_query_fail(self):
+        self._test_set_static_network_config(adapter=False, legacy=True)
 
-    def test_set_static_network_config_cannot_set_ip(self):
+    def test_set_static_network_config_legacy_cannot_set_ip(self):
         ret_val1 = (2,)
-        self._test_set_static_network_config(static_val=ret_val1)
+        self._test_set_static_network_config(static_val=ret_val1, legacy=True)
 
-    def test_set_static_network_config_cannot_set_gateway(self):
+    def test_set_static_network_config_legacy_cannot_set_gateway(self):
         ret_val1 = (1,)
         ret_val2 = (2,)
         self._test_set_static_network_config(static_val=ret_val1,
-                                             gateway_val=ret_val2)
+                                             gateway_val=ret_val2,
+                                             legacy=True)
 
-    def test_set_static_network_config_cannot_set_DNS(self):
+    def test_set_static_network_config_legacy_cannot_set_DNS(self):
         ret_val1 = (1,)
         ret_val2 = (1,)
         ret_val3 = (2,)
         self._test_set_static_network_config(static_val=ret_val1,
                                              gateway_val=ret_val2,
-                                             dns_val=ret_val3)
+                                             dns_val=ret_val3,
+                                             legacy=True)
 
-    def test_set_static_network_config_no_reboot(self):
+    def test_set_static_network_config_legacy_no_reboot(self):
         ret_val1 = (0,)
         ret_val2 = (0,)
         ret_val3 = (0,)
         self._test_set_static_network_config(static_val=ret_val1,
                                              gateway_val=ret_val2,
-                                             dns_val=ret_val3)
+                                             dns_val=ret_val3,
+                                             legacy=True)
 
-    def test_set_static_network_config_v6(self):
-        self._test_set_static_network_config_v6()
+    def test_set_static_network_config_ipv4(self):
+        self._test_set_static_network_config(ipv6=False)
 
-    def test_set_static_network_config_v6_no_adapters(self):
-        self._test_set_static_network_config_v6(v6adapters=False)
+    def test_set_static_network_config_ipv6(self):
+        self._test_set_static_network_config(ipv6=True)
 
-    def test_set_static_network_config_v6_error(self):
-        self._test_set_static_network_config_v6(v6error=True)
+    @mock.patch('cloudbaseinit.osutils.windows.WindowsUtils'
+                '.execute_process')
+    @mock.patch('cloudbaseinit.osutils.windows.WindowsUtils'
+                '._get_system_dir')
+    def _test_rename_network_adapter(self, should_fail, mock_get_system_dir,
+                                     mock_execute_process):
+        base_dir = "fake path"
+        old_name = "fake_old"
+        new_name = "fake_new"
+        mock_get_system_dir.return_value = base_dir
+        ret_val = 1 if should_fail else 0
+        mock_execute_process.return_value = (None, None, ret_val)
+
+        if should_fail:
+            with self.assertRaises(exception.CloudbaseInitException):
+                self._winutils.rename_network_adapter(old_name, new_name)
+        else:
+            self._winutils.rename_network_adapter(old_name, new_name)
+
+        mock_get_system_dir.assert_called_once_with()
+        args = [os.path.join(base_dir, "netsh.exe"), "interface", "set",
+                "interface", 'name=%s' % old_name, 'newname=%s' % new_name]
+        mock_execute_process.assert_called_once_with(args, shell=False)
 
     def _test_get_config_key_name(self, section):
         response = self._winutils._get_config_key_name(section)
@@ -776,6 +832,12 @@ class TestWindowsUtils(testutils.CloudbaseInitTestBase):
 
     def test_get_config_key_name_no_section(self):
         self._test_get_config_key_name(None)
+
+    def test_rename_network_adapter(self):
+        self._test_rename_network_adapter(False)
+
+    def test_rename_network_adapter_fail(self):
+        self._test_rename_network_adapter(True)
 
     @mock.patch('cloudbaseinit.osutils.windows.WindowsUtils'
                 '._get_config_key_name')
@@ -1296,6 +1358,14 @@ class TestWindowsUtils(testutils.CloudbaseInitTestBase):
 
     def test_check_os_version_fail(self):
         self._test_check_os_version(ret_val=mock.Mock(), fail=True)
+
+    @mock.patch('cloudbaseinit.osutils.windows.WindowsUtils'
+                '.get_os_version')
+    def test_is_client_os(self, mock_get_os_version):
+        mock_get_os_version.return_value = {
+            "product_type": self._winutils.VER_NT_WORKSTATION}
+
+        self.assertEqual(True, self._winutils.is_client_os())
 
     def _test_get_volume_label(self, ret_val):
         label = mock.MagicMock()
@@ -1878,15 +1948,18 @@ class TestWindowsUtils(testutils.CloudbaseInitTestBase):
     @mock.patch('cloudbaseinit.utils.windows.network.get_adapter_addresses')
     def test_get_dhcp_hosts_in_use(self, mock_get_adapter_addresses):
         net_addr = {}
-        net_addr["mac_address"] = 'fake mac address'
-        net_addr["dhcp_server"] = 'fake dhcp server'
+        net_addr["friendly_name"] = mock.sentinel.friendly_name
+        net_addr["mac_address"] = mock.sentinel.mac_address
+        net_addr["dhcp_server"] = mock.sentinel.dhcp_server
         net_addr["dhcp_enabled"] = True
         mock_get_adapter_addresses.return_value = [net_addr]
 
         response = self._winutils.get_dhcp_hosts_in_use()
 
         mock_get_adapter_addresses.assert_called_once_with()
-        self.assertEqual([('fake mac address', 'fake dhcp server')], response)
+        self.assertEqual([(mock.sentinel.friendly_name,
+                           mock.sentinel.mac_address,
+                           mock.sentinel.dhcp_server)], response)
 
     @mock.patch('cloudbaseinit.osutils.windows.WindowsUtils'
                 '.check_sysnative_dir_exists')
@@ -1939,6 +2012,58 @@ class TestWindowsUtils(testutils.CloudbaseInitTestBase):
         self._test_set_ntp_client_config(sysnative=False,
                                          ret_val='fake return value')
 
+    @mock.patch("cloudbaseinit.utils.windows.network."
+                "get_adapter_addresses")
+    def _test_get_network_adapter_name_by_mac_address(
+            self, mock_get_adapter_addresses,
+            no_adapters_found=False,
+            multiple_adapters_found=False):
+
+        mock.sentinel.mac_address = "aa:bb:cc:dd:ee:ff"
+
+        if no_adapters_found:
+            mock_get_adapter_addresses.return_value = []
+        elif multiple_adapters_found:
+            mock_get_adapter_addresses.return_value = [{
+                "mac_address": mock.sentinel.mac_address,
+                "friendly_name": mock.sentinel.friendly_name,
+            }, {
+                "mac_address": mock.sentinel.mac_address,
+                "friendly_name": mock.sentinel.friendly_name2,
+            }]
+        else:
+            mock_get_adapter_addresses.return_value = [{
+                "mac_address": mock.sentinel.mac_address.upper(),
+                "friendly_name": mock.sentinel.friendly_name,
+            }]
+
+        if no_adapters_found:
+            with self.assertRaises(exception.ItemNotFoundException):
+                self._winutils.get_network_adapter_name_by_mac_address(
+                    mock.sentinel.mac_address)
+        elif multiple_adapters_found:
+            with self.assertRaises(exception.CloudbaseInitException):
+                self._winutils.get_network_adapter_name_by_mac_address(
+                    mock.sentinel.mac_address)
+        else:
+            self.assertEqual(
+                mock.sentinel.friendly_name,
+                self._winutils.get_network_adapter_name_by_mac_address(
+                    mock.sentinel.mac_address))
+
+        mock_get_adapter_addresses.assert_called_once_with()
+
+    def test_get_network_adapter_name_by_mac_address(self):
+        self._test_get_network_adapter_name_by_mac_address()
+
+    def test_get_network_adapter_name_by_mac_address_no_adapters(self):
+        self._test_get_network_adapter_name_by_mac_address(
+            no_adapters_found=True)
+
+    def test_get_network_adapter_name_by_mac_address_multiple_adapters(self):
+        self._test_get_network_adapter_name_by_mac_address(
+            multiple_adapters_found=True)
+
     @mock.patch('cloudbaseinit.osutils.windows.WindowsUtils'
                 '.execute_process')
     @mock.patch('cloudbaseinit.osutils.windows.WindowsUtils'
@@ -1953,34 +2078,37 @@ class TestWindowsUtils(testutils.CloudbaseInitTestBase):
                                       mock_get_system_dir,
                                       mock_execute_process,
                                       fail=False, os_version_ret=True,
-                                      mac_address_match=True,
+                                      name_match=True,
                                       execute_process_val=0):
-        mac_address = "fake mac"
+        name = "fake name"
+        index = 1
         mtu = "fake mtu"
         base_dir = "fake path"
         mock_check_os_version.return_value = os_version_ret
         mock_get_adapter_addresses.return_value = [mock.MagicMock()
                                                    for _ in range(3)]
-        if mac_address_match:
-            # Same as `iface_index` under the "interface_index" key.
-            mock_get_adapter_addresses.return_value[1].\
-                __getitem__.return_value = mac_address
+        if name_match:
+            mock_get_adapter_addresses.return_value = [
+                {"friendly_name": name, "interface_index": index}]
+        else:
+            mock_get_adapter_addresses.return_value = []
+
         mock_get_system_dir.return_value = base_dir
         mock_execute_process.return_value = [None, None, execute_process_val]
 
         if fail:
             with self.assertRaises(exception.CloudbaseInitException):
-                self._winutils.set_network_adapter_mtu(mac_address, mtu)
+                self._winutils.set_network_adapter_mtu(name, mtu)
             return
 
         with self.snatcher:
-            self._winutils.set_network_adapter_mtu(mac_address, mtu)
-        expected_log = ['Setting MTU for interface "%(mac_address)s" with '
+            self._winutils.set_network_adapter_mtu(name, mtu)
+        expected_log = ['Setting MTU for interface "%(name)s" with '
                         'value "%(mtu)s"' %
-                        {'mac_address': mac_address, 'mtu': mtu}]
+                        {'name': name, 'mtu': mtu}]
         args = [os.path.join(base_dir, "netsh.exe"),
                 "interface", "ipv4", "set", "subinterface",
-                mac_address, "mtu=%s" % mtu, "store=persistent"]
+                str(index), "mtu=%s" % mtu, "store=persistent"]
         self.assertEqual(expected_log, self.snatcher.output)
         mock_check_os_version.assert_called_once_with(6, 0)
         mock_get_adapter_addresses.assert_called_once_with()
@@ -1990,9 +2118,9 @@ class TestWindowsUtils(testutils.CloudbaseInitTestBase):
     def test_set_network_adapter_mtu_not_supported(self):
         self._test_set_network_adapter_mtu(fail=True, os_version_ret=False)
 
-    def test_set_network_adapter_mtu_no_mac_match(self):
+    def test_set_network_adapter_mtu_no_name_match(self):
         self._test_set_network_adapter_mtu(fail=True,
-                                           mac_address_match=False)
+                                           name_match=False)
 
     def test_set_network_adapter_mtu_execute_fail(self):
         self._test_set_network_adapter_mtu(fail=True,
@@ -2593,3 +2721,48 @@ class TestWindowsUtils(testutils.CloudbaseInitTestBase):
         self._win32api_mock.GetFileVersionInfo.assert_called_once_with(
             mock_path, '\\')
         self.assertIsNotNone(res)
+
+    @mock.patch('cloudbaseinit.utils.windows.netlbfo.NetLBFOTeamManager')
+    def test_get_network_team_manager(self, mock_netlbfo_team_manager):
+        mock_netlbfo_team_manager.is_available.return_value = True
+        self.assertEqual(
+            mock_netlbfo_team_manager.return_value,
+            self._winutils._get_network_team_manager())
+
+    @mock.patch('cloudbaseinit.utils.windows.netlbfo.NetLBFOTeamManager')
+    def test_get_network_team_manager_not_found(self,
+                                                mock_netlbfo_team_manager):
+        mock_netlbfo_team_manager.is_available.return_value = False
+        self.assertRaises(
+            exception.ItemNotFoundException,
+            self._winutils._get_network_team_manager)
+
+    @mock.patch('cloudbaseinit.osutils.windows.WindowsUtils.'
+                '_get_network_team_manager')
+    def test_create_network_team(self, mock_get_network_team_manager):
+        mock_team_manager = mock_get_network_team_manager.return_value
+
+        self._winutils.create_network_team(
+            mock.sentinel.team_name, mock.sentinel.mode,
+            mock.sentinel.lb_algo, mock.sentinel.members,
+            mock.sentinel.mac, mock.sentinel.primary_name,
+            mock.sentinel.vlan_id, mock.sentinel.lacp_timer)
+
+        mock_team_manager.create_team.assert_called_once_with(
+            mock.sentinel.team_name, mock.sentinel.mode,
+            mock.sentinel.lb_algo, mock.sentinel.members,
+            mock.sentinel.mac, mock.sentinel.primary_name,
+            mock.sentinel.vlan_id, mock.sentinel.lacp_timer)
+
+    @mock.patch('cloudbaseinit.osutils.windows.WindowsUtils.'
+                '_get_network_team_manager')
+    def test_add_network_team_nic(self, mock_get_network_team_manager):
+        mock_team_manager = mock_get_network_team_manager.return_value
+
+        self._winutils.add_network_team_nic(
+            mock.sentinel.team_name, mock.sentinel.nic_name,
+            mock.sentinel.vlan_id)
+
+        mock_team_manager.add_team_nic.assert_called_once_with(
+            mock.sentinel.team_name, mock.sentinel.nic_name,
+            mock.sentinel.vlan_id)

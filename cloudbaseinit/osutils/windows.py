@@ -21,6 +21,7 @@ import struct
 import subprocess
 import time
 
+import netaddr
 from oslo_log import log as oslo_logging
 import pywintypes
 import six
@@ -34,17 +35,21 @@ import win32process
 import win32security
 import win32service
 import winerror
-import wmi
 
 from cloudbaseinit import exception
 from cloudbaseinit.osutils import base
+from cloudbaseinit.utils import classloader
 from cloudbaseinit.utils.windows import disk
 from cloudbaseinit.utils.windows import network
 from cloudbaseinit.utils.windows import privilege
 from cloudbaseinit.utils.windows import timezone
+from cloudbaseinit.utils.windows import wmi_loader
 
+wmi = wmi_loader.wmi()
 
 LOG = oslo_logging.getLogger(__name__)
+
+AF_INET = 2
 AF_INET6 = 23
 UNICAST = 1
 MANUAL = 1
@@ -259,6 +264,17 @@ kernel32.GetVolumePathNamesForVolumeNameW.argtypes = [wintypes.LPCWSTR,
                                                           wintypes.DWORD)]
 kernel32.GetVolumePathNamesForVolumeNameW.restype = wintypes.BOOL
 
+kernel32.FindFirstVolumeW.argtypes = [wintypes.LPWSTR, wintypes.DWORD]
+kernel32.FindFirstVolumeW.restype = wintypes.HANDLE
+
+kernel32.FindNextVolumeW.argtypes = [wintypes.HANDLE,
+                                     wintypes.LPWSTR,
+                                     wintypes.DWORD]
+kernel32.FindNextVolumeW.restype = wintypes.BOOL
+
+kernel32.FindVolumeClose.argtypes = [wintypes.HANDLE]
+kernel32.FindVolumeClose.restype = wintypes.BOOL
+
 iphlpapi.GetIpForwardTable.argtypes = [
     ctypes.POINTER(Win32_MIB_IPFORWARDTABLE),
     ctypes.POINTER(wintypes.ULONG),
@@ -402,6 +418,11 @@ class WindowsUtils(base.BaseOSUtils):
     _FW_IP_PROTOCOL_UDP = 17
     _FW_SCOPE_ALL = 0
     _FW_SCOPE_LOCAL_SUBNET = 1
+
+    VER_NT_WORKSTATION = 1
+
+    def __init__(self):
+        self._network_team_manager = None
 
     def reboot(self):
         with privilege.acquire_privilege(win32security.SE_SHUTDOWN_NAME):
@@ -689,13 +710,14 @@ class WindowsUtils(base.BaseOSUtils):
             wql += ' AND PhysicalAdapter = True'
 
         q = conn.query(wql)
-        return [(r.Name, r.MACAddress) for r in q]
+        return [(r.NetConnectionID, r.MACAddress) for r in q]
 
     def get_dhcp_hosts_in_use(self):
         dhcp_hosts = []
         for net_addr in network.get_adapter_addresses():
             if net_addr["dhcp_enabled"] and net_addr["dhcp_server"]:
-                dhcp_hosts.append((net_addr["mac_address"],
+                dhcp_hosts.append((net_addr["friendly_name"],
+                                   net_addr["mac_address"],
                                    net_addr["dhcp_server"]))
         return dhcp_hosts
 
@@ -716,7 +738,26 @@ class WindowsUtils(base.BaseOSUtils):
                 'w32tm failed to configure NTP.\nOutput: %(out)s\nError:'
                 ' %(err)s' % {'out': out, 'err': err})
 
-    def set_network_adapter_mtu(self, mac_address, mtu):
+    def get_network_adapter_name_by_mac_address(self, mac_address):
+        iface_index_list = [
+            net_addr for net_addr
+            in network.get_adapter_addresses()
+            if net_addr["mac_address"] is not None and
+            net_addr["mac_address"].lower() == mac_address.lower()]
+
+        if not iface_index_list:
+            raise exception.ItemNotFoundException(
+                'Network interface with MAC address "%s" not found' %
+                mac_address)
+
+        if len(iface_index_list) > 1:
+            raise exception.CloudbaseInitException(
+                'Multiple network interfaces with MAC address "%s" exist' %
+                mac_address)
+
+        return iface_index_list[0]["friendly_name"]
+
+    def set_network_adapter_mtu(self, name, mtu):
         if not self.check_os_version(6, 0):
             raise exception.CloudbaseInitException(
                 'Setting the MTU is currently not supported on Windows XP '
@@ -725,18 +766,18 @@ class WindowsUtils(base.BaseOSUtils):
         iface_index_list = [
             net_addr["interface_index"] for net_addr
             in network.get_adapter_addresses()
-            if net_addr["mac_address"] == mac_address]
+            if net_addr["friendly_name"] == name]
 
         if not iface_index_list:
-            raise exception.CloudbaseInitException(
-                'Network interface with MAC address "%s" not found' %
-                mac_address)
+            raise exception.ItemNotFoundException(
+                'Network interface with name "%s" not found' %
+                name)
         else:
             iface_index = iface_index_list[0]
 
-            LOG.debug('Setting MTU for interface "%(mac_address)s" with '
+            LOG.debug('Setting MTU for interface "%(name)s" with '
                       'value "%(mtu)s"',
-                      {'mac_address': mac_address, 'mtu': mtu})
+                      {'name': name, 'mtu': mtu})
 
             base_dir = self._get_system_dir()
             netsh_path = os.path.join(base_dir, 'netsh.exe')
@@ -747,28 +788,45 @@ class WindowsUtils(base.BaseOSUtils):
             (out, err, ret_val) = self.execute_process(args, shell=False)
             if ret_val:
                 raise exception.CloudbaseInitException(
-                    'Setting MTU for interface "%(mac_address)s" with '
-                    'value "%(mtu)s" failed' % {'mac_address': mac_address,
-                                                'mtu': mtu})
+                    'Setting MTU for interface "%(name)s" with '
+                    'value "%(mtu)s" failed' % {'name': name, 'mtu': mtu})
 
-    def set_static_network_config(self, mac_address, address, netmask,
-                                  broadcast, gateway, dnsnameservers):
+    def rename_network_adapter(self, old_name, new_name):
+        base_dir = self._get_system_dir()
+        netsh_path = os.path.join(base_dir, 'netsh.exe')
+
+        args = [netsh_path, "interface", "set", "interface",
+                'name=%s' % old_name, 'newname=%s' % new_name]
+        (out, err, ret_val) = self.execute_process(args, shell=False)
+        if ret_val:
+            raise exception.CloudbaseInitException(
+                'Renaming interface "%(old_name)s" to "%(new_name)s" '
+                'failed' % {'old_name': old_name, 'new_name': new_name})
+
+    @staticmethod
+    def _get_network_adapter(name):
         conn = wmi.WMI(moniker='//./root/cimv2')
-
-        query = conn.query("SELECT * FROM Win32_NetworkAdapter WHERE "
-                           "MACAddress = '{}'".format(mac_address))
+        query = conn.Win32_NetworkAdapter(NetConnectionID=name)
         if not len(query):
             raise exception.CloudbaseInitException(
-                "Network adapter not found")
+                "Network adapter not found: %s" % name)
+        return query[0]
 
-        adapter_config = query[0].associators(
+    @staticmethod
+    def _set_static_network_config_legacy(name, address, netmask, gateway,
+                                          dnsnameservers):
+        if netaddr.valid_ipv6(address):
+            LOG.warning("Setting IPv6 info not available on this system")
+            return
+
+        adapter_config = WindowsUtils._get_network_adapter(name).associators(
             wmi_result_class='Win32_NetworkAdapterConfiguration')[0]
 
         LOG.debug("Setting static IP address")
         (ret_val,) = adapter_config.EnableStatic([address], [netmask])
         if ret_val > 1:
             raise exception.CloudbaseInitException(
-                "Cannot set static IP address on network adapter (%d)",
+                "Cannot set static IP address on network adapter: %d" %
                 ret_val)
         reboot_required = (ret_val == 1)
 
@@ -777,8 +835,7 @@ class WindowsUtils(base.BaseOSUtils):
             (ret_val,) = adapter_config.SetGateways([gateway], [1])
             if ret_val > 1:
                 raise exception.CloudbaseInitException(
-                    "Cannot set gateway on network adapter (%d)",
-                    ret_val)
+                    "Cannot set gateway on network adapter: %d" % ret_val)
             reboot_required = reboot_required or ret_val == 1
 
         if dnsnameservers:
@@ -786,62 +843,139 @@ class WindowsUtils(base.BaseOSUtils):
             (ret_val,) = adapter_config.SetDNSServerSearchOrder(dnsnameservers)
             if ret_val > 1:
                 raise exception.CloudbaseInitException(
-                    "Cannot set DNS on network adapter (%d)",
-                    ret_val)
+                    "Cannot set DNS on network adapter: %d" % ret_val)
             reboot_required = reboot_required or ret_val == 1
 
         return reboot_required
 
-    def set_static_network_config_v6(self, mac_address, address6,
-                                     netmask6, gateway6):
-        """Set IPv6 info for a network card."""
+    @staticmethod
+    def _fix_network_adapter_dhcp(interface_name, enable_dhcp, address_family):
+        interface_id = WindowsUtils._get_network_adapter(interface_name).GUID
+        tcpip_key = "Tcpip6" if address_family == AF_INET6 else "Tcpip"
 
-        # Get local properties by MAC identification.
-        adapters = network.get_adapter_addresses()
-        for adapter in adapters:
-            if mac_address == adapter["mac_address"]:
-                ifname = adapter["friendly_name"]
-                ifindex = adapter["interface_index"]
-                break
+        with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\services\\%(tcpip_key)s\\"
+                "Parameters\\Interfaces\\%(interface_id)s" %
+                {"tcpip_key": tcpip_key, "interface_id": interface_id},
+                0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(
+                key, 'EnableDHCP', 0, winreg.REG_DWORD,
+                1 if enable_dhcp else 0)
+
+    @staticmethod
+    def _set_interface_dns(interface_name, dnsnameservers):
+        # Import here to avoid loading errors on Windows versions where MI is
+        # not available
+        import mi
+
+        conn = wmi.WMI(moniker='//./root/standardcimv2')
+        # Requires Windows >= 6.2
+        dns_client = conn.MSFT_DnsClientServerAddress(
+            InterfaceAlias=interface_name)
+        if not len(dns_client):
+            raise exception.ItemNotFoundException(
+                'Network interface with name "%s" not found' %
+                interface_name)
+        dns_client = dns_client[0]
+
+        custom_options = [{
+            u'name': u'ServerAddresses',
+            u'value_type': mi.MI_ARRAY | mi.MI_STRING,
+            u'value': dnsnameservers
+        }]
+
+        operation_options = {u'custom_options': custom_options}
+        dns_client.put(operation_options=operation_options)
+
+    def enable_network_adapter(self, name, enabled):
+        adapter = self._get_network_adapter(name)
+        if enabled:
+            adapter.Enable()
         else:
-            raise exception.CloudbaseInitException(
-                "Adapter with MAC {!r} not available".format(mac_address))
+            adapter.Disable()
 
-        # TODO(cpoieana): Extend support for other platforms.
-        #                 Currently windows8 @ ws2012 or above.
-        if not self.check_os_version(6, 2):
-            LOG.warning("Setting IPv6 info not available "
-                        "on this system")
-            return
-        conn = wmi.WMI(moniker='//./root/StandardCimv2')
-        query = conn.query("SELECT * FROM MSFT_NetIPAddress "
-                           "WHERE InterfaceAlias = '{}'".format(ifname))
-        netip = query[0]
+    @staticmethod
+    def _set_static_network_config(name, address, prefix_len, gateway):
+        if netaddr.valid_ipv6(address):
+            family = AF_INET6
+        else:
+            family = AF_INET
 
-        params = {
-            "InterfaceIndex": ifindex,
-            "InterfaceAlias": ifname,
-            "IPAddress": address6,
-            "AddressFamily": AF_INET6,
-            "PrefixLength": netmask6,
-            # Manual set type.
-            "Type": UNICAST,
-            "PrefixOrigin": MANUAL,
-            "SuffixOrigin": MANUAL,
-            "AddressState": PREFERRED_ADDR,
-            # No expiry.
-            "ValidLifetime": None,
-            "PreferredLifetime": None,
-            "SkipAsSource": False,
-            "DefaultGateway": gateway6,
-            "PolicyStore": None,
-            "PassThru": False,
-        }
-        LOG.debug("Setting IPv6 info for %s", ifname)
-        try:
-            netip.Create(**params)
-        except wmi.x_wmi as exc:
-            raise exception.CloudbaseInitException(exc.com_error)
+        # This is needed to avoid the error:
+        # "Inconsistent parameters PolicyStore PersistentStore and
+        # Dhcp Enabled"
+        WindowsUtils._fix_network_adapter_dhcp(name, False, family)
+
+        conn = wmi.WMI(moniker='//./root/standardcimv2')
+        existing_addresses = conn.MSFT_NetIPAddress(
+            AddressFamily=family, InterfaceAlias=name)
+        for existing_address in existing_addresses:
+            LOG.debug(
+                "Removing existing IP address \"%(ip)s\" "
+                "from adapter \"%(name)s\"",
+                {"ip": existing_address.IPAddress, "name": name})
+            existing_address.Delete_()
+
+        existing_routes = conn.MSFT_NetRoute(
+            AddressFamily=family, InterfaceAlias=name)
+        for existing_route in existing_routes:
+            LOG.debug(
+                "Removing existing route \"%(route)s\" "
+                "from adapter \"%(name)s\"",
+                {"route": existing_route.DestinationPrefix, "name": name})
+            existing_route.Delete_()
+
+        conn.MSFT_NetIPAddress.create(
+            AddressFamily=family, InterfaceAlias=name, IPAddress=address,
+            PrefixLength=prefix_len, DefaultGateway=gateway)
+
+    def set_static_network_config(self, name, address, prefix_len_or_netmask,
+                                  gateway, dnsnameservers):
+        ip_network = netaddr.IPNetwork(
+            u"%s/%s" % (address, prefix_len_or_netmask))
+        prefix_len = ip_network.prefixlen
+        netmask = str(ip_network.netmask)
+
+        if self.check_os_version(6, 2):
+            self._set_static_network_config(
+                name, address, prefix_len, gateway)
+            if len(dnsnameservers):
+                self._set_interface_dns(name, dnsnameservers)
+        else:
+            return self._set_static_network_config_legacy(
+                name, address, netmask, gateway, dnsnameservers)
+
+    def _get_network_team_manager(self):
+        if self._network_team_manager:
+            return self._network_team_manager
+
+        team_managers = [
+            "cloudbaseinit.utils.windows.netlbfo.NetLBFOTeamManager",
+        ]
+
+        cl = classloader.ClassLoader()
+        for class_name in team_managers:
+            try:
+                cls = cl.load_class(class_name)
+                if cls.is_available():
+                    self._network_team_manager = cls()
+                    return self._network_team_manager
+            except Exception as ex:
+                LOG.exception(ex)
+        raise exception.ItemNotFoundException(
+            "No network team manager available")
+
+    def create_network_team(self, team_name, mode, load_balancing_algorithm,
+                            members, mac_address, primary_nic_name=None,
+                            primary_nic_vlan_id=None, lacp_timer=None):
+        self._get_network_team_manager().create_team(
+            team_name, mode, load_balancing_algorithm, members, mac_address,
+            primary_nic_name, primary_nic_vlan_id, lacp_timer)
+
+    def add_network_team_nic(self, team_name, nic_name, vlan_id):
+        self._get_network_team_manager().add_team_nic(
+            team_name, nic_name, vlan_id)
 
     def _get_config_key_name(self, section):
         key_name = self._config_key
@@ -1163,6 +1297,9 @@ class WindowsUtils(base.BaseOSUtils):
                 "suite_mask": vi.wSuiteMask,
                 "product_type": vi.wProductType}
 
+    def is_client_os(self):
+        return self.get_os_version()["product_type"] == self.VER_NT_WORKSTATION
+
     def check_os_version(self, major, minor, build=0):
         vi = Win32_OSVERSIONINFOEX_W()
         vi.dwOSVersionInfoSize = ctypes.sizeof(Win32_OSVERSIONINFOEX_W)
@@ -1365,7 +1502,6 @@ class WindowsUtils(base.BaseOSUtils):
         if handle_volumes == self.INVALID_HANDLE_VALUE:
             raise exception.WindowsCloudbaseInitException(
                 "FindFirstVolumeW failed: %r")
-
         try:
             while True:
                 volumes.append(volume.value)
