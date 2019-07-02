@@ -78,8 +78,28 @@ class BaseOSUtils(object):
     def get_network_adapters(self):
         raise NotImplementedError()
 
-    def set_static_network_config(self, mac_address, address, netmask,
-                                  broadcast, gateway, dnsnameservers):
+    def get_network_adapter_name_by_mac_address(self, mac_address):
+        raise NotImplementedError()
+
+    def set_network_adapter_mtu(self, name, mtu):
+        raise NotImplementedError()
+
+    def rename_network_adapter(self, old_name, new_name):
+        raise NotImplementedError()
+
+    def enable_network_adapter(self, name, enabled):
+        raise NotImplementedError()
+
+    def set_static_network_config(self, name, address, prefix_len_or_netmask,
+                                  gateway, dnsnameservers):
+        raise NotImplementedError()
+
+    def create_network_team(self, team_name, mode, load_balancing_algorithm,
+                            members, mac_address, primary_nic_name=None,
+                            primary_nic_vlan_id=None, lacp_timer=None):
+        raise NotImplementedError()
+
+    def add_network_team_nic(self, team_name, nic_name, vlan_id):
         raise NotImplementedError()
 
     def set_config_value(self, name, value, section=None):
