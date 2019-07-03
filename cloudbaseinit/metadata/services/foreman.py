@@ -45,4 +45,5 @@ class Foreman(base.BaseHTTPMetadataService):
             return False
 
     def get_user_data(self):
-        return self._get_cache_data('userdata/user-data')
+        return self._get_cache_data('%s/userdata/user-data' %
+                      self._base_url)

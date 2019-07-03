@@ -27,7 +27,7 @@ class ForemanOptions(conf_base.Options):
         super(ForemanOptions, self).__init__(config, group="foreman")
         self._options = [
             cfg.StrOpt(
-                "metadata_base_url", default="http://foreman.example.invalid/",
+                "metadata_base_url", default="http://foreman.localdomain",
                 help="The base URL where the service looks for metadata",
                 deprecated_name="foreman_metadata_base_url",
                 deprecated_group="DEFAULT"),
